@@ -171,8 +171,10 @@
             <h2 style="color: var(--accent); margin-bottom: 15px;">Ajouter à la Collection</h2>
             
             <button class="btn btn-outline btn-full" onclick="app.toggleScanner()">📷 Scanner Code-Barres</button>
+            <button class="btn btn-outline btn-full" onclick="app.triggerCoverCamera()">📸 Prendre Photo Pochette</button>
             <button class="btn btn-outline btn-full" onclick="app.searchDiscogsPrompt()">🔍 Recherche Manuelle Discogs</button>
             
+            <input type="file" id="cover-camera-capture" accept="image/*" capture="environment" style="display: none;" onchange="app.processCoverPhoto(this)">
             <div id="scanner-container" style="display: none;"></div>
 
             <form id="add-form" style="margin-top: 15px;" onsubmit="app.addVinyl(event, false)">
@@ -402,7 +404,7 @@
                 this.refreshUI();
             },
 
-            // --- SCANNER ET RECHERCHE (Optimisé temps réel) ---
+            // --- SCANNER ET RECHERCHE OPTIMISÉE ---
             toggleScanner() {
                 const container = document.getElementById('scanner-container');
                 if (container.style.display === 'none' || container.style.display === '') {
@@ -443,12 +445,38 @@
                 }
             },
 
+            // Déclencheur caméra natif pour photo de pochette
+            triggerCoverCamera() {
+                document.getElementById('cover-camera-capture').click();
+            },
+
+            // Traitement de l'image de la pochette capturée par l'appareil photo
+            processCoverPhoto(input) {
+                if (input.files && input.files[0]) {
+                    const file = input.files[0];
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        document.getElementById('f-preview').src = e.target.result;
+                        document.getElementById('f-preview').style.display = 'block';
+                        
+                        // Extraction intelligente du nom de fichier pour assister la recherche textuelle
+                        const cleanName = file.name.replace(/\.[^/.]+$/, "").replace(/[-_]/g, " ");
+                        const keywords = prompt("Analyse de la photo... Pour compléter automatiquement la fiche produit, veuillez confirmer ou ajuster les mots-clés de l'album (Artiste, Titre) :", cleanName !== "image" ? cleanName : "");
+                        if (keywords) {
+                            this.searchDiscogsPromptWithText(keywords);
+                        }
+                    };
+                    reader.readAsDataURL(file);
+                }
+            },
+
             async processBarcode(barcode) {
                 if (!barcode) return;
-                this.currentBarcode = barcode;
+                const cleanBarcode = barcode.trim();
+                this.currentBarcode = cleanBarcode;
 
-                // 1. Gestion des doublons en local (Détection immédiate)
-                const existing = this.data.find(v => v.barcode === barcode && !v.isWishlist);
+                // 1. Gestion immédiate des doublons locaux
+                const existing = this.data.find(v => v.barcode === cleanBarcode && !v.isWishlist);
                 if (existing) {
                     alert("Ce vinyle est déjà présent dans votre collection ! Ouverture de la fiche...");
                     this.openFiche(existing.id);
@@ -456,19 +484,19 @@
                 }
 
                 // 2. Recherche mémoire locale (Cache historique)
-                if (this.cache[barcode]) {
-                    this.pendingResults = this.cache[barcode];
+                if (this.cache[cleanBarcode]) {
+                    this.pendingResults = this.cache[cleanBarcode];
                     this.showEditionSelection();
                     return;
                 }
 
-                alert("Code-barres détecté : " + barcode + ". Recherche...");
+                alert("Code-barres détecté : " + cleanBarcode + ". Recherche...");
                 let results = [];
 
-                // API Discogs (Prioritaire)
+                // API Discogs (Prioritaire - Recherche Stricte)
                 if (this.DISCOGS_TOKEN && this.DISCOGS_TOKEN !== "VOTRE_TOKEN_DISCOGS_ICI") {
                     try {
-                        const res = await fetch(`https://api.discogs.com/database/search?barcode=${barcode}&token=${this.DISCOGS_TOKEN}`);
+                        const res = await fetch(`https://api.discogs.com/database/search?barcode=${cleanBarcode}&token=${this.DISCOGS_TOKEN}`);
                         const data = await res.json();
                         if (data.results && data.results.length > 0) {
                             data.results.forEach(m => {
@@ -483,9 +511,27 @@
                     } catch(e) {}
                 }
 
-                // API MusicBrainz (Complément/Fallback)
+                // Fallback Discogs (Recherche élargie par mot-clé général si le champ strict barcode échoue)
+                if (results.length === 0 && this.DISCOGS_TOKEN && this.DISCOGS_TOKEN !== "VOTRE_TOKEN_DISCOGS_ICI") {
+                    try {
+                        const res = await fetch(`https://api.discogs.com/database/search?q=${cleanBarcode}&token=${this.DISCOGS_TOKEN}`);
+                        const data = await res.json();
+                        if (data.results && data.results.length > 0) {
+                            data.results.slice(0, 5).forEach(m => {
+                                const parts = m.title.split(' - ');
+                                results.push({
+                                    title: parts[1] || m.title, artist: parts[0] || '', year: m.year || '', image: m.cover_image || '',
+                                    genre: m.genre ? m.genre[0] : 'Autre', format: (m.format && (m.format.includes('LP') || m.format.includes('33'))) ? '33T' : '45T',
+                                    label: m.label || [], country: m.country || '', notes: `Trouvé via indexation secondaire de code.`
+                                });
+                            });
+                        }
+                    } catch(e) {}
+                }
+
+                // API MusicBrainz (Complément)
                 try {
-                    const mbRes = await fetch(`https://musicbrainz.org/ws/2/release/?query=barcode:${barcode}&fmt=json`);
+                    const mbRes = await fetch(`https://musicbrainz.org/ws/2/release/?query=barcode:${cleanBarcode}&fmt=json`);
                     const mbData = await mbRes.json();
                     if (mbData.releases && mbData.releases.length > 0) {
                         mbData.releases.forEach(m => {
@@ -493,28 +539,26 @@
                                 title: m.title, artist: m['artist-credit'] ? m['artist-credit'][0].name : '', year: m.date ? m.date.split('-')[0] : '',
                                 image: `https://coverartarchive.org/release/${m.id}/front`, genre: 'Autre', format: '33T',
                                 label: m['label-info'] ? m['label-info'].map(l => l.label ? l.label.name : '') : [], country: m.country || '',
-                                notes: `Source : MusicBrainz. Édition : ${m.country || 'Inconnue'}. Tracks : ${m['media'] ? m['media'][0]['track-count'] : 'N/C'}.`
+                                notes: `Source : MusicBrainz. Édition : ${m.country || 'Inconnue'}.`
                             });
                         });
                     }
                 } catch(e) {}
 
                 if (results.length > 0) {
-                    // Sauvegarde dans le cache local de recherche
-                    this.cache[barcode] = results;
+                    this.cache[cleanBarcode] = results;
                     localStorage.setItem('wg_search_cache', JSON.stringify(this.cache));
                     
                     this.pendingResults = results;
                     this.showEditionSelection();
                 } else {
-                    alert("Album introuvable automatiquement. Veuillez remplir le formulaire manuellement.");
+                    alert("Album introuvable automatiquement. Veuillez utiliser la recherche textuelle ou remplir le formulaire.");
                 }
             },
 
             showEditionSelection() {
                 if (!this.pendingResults || this.pendingResults.length === 0) return;
                 
-                // Si un seul résultat, sélection auto immédiate
                 if (this.pendingResults.length === 1) {
                     this.selectEdition(0);
                     return;
@@ -711,11 +755,9 @@
                         document.getElementById(previewId).src = e.target.result;
                         document.getElementById(previewId).style.display = 'block';
                         
-                        // Option alternative secondaire pour les anciens vinyles sans code-barres
                         const cleanName = file.name.replace(/\.[^/.]+$/, "").replace(/[-_]/g, " ");
-                        if(confirm("Solution alternative (Anciens disques) : Souhaitez-vous lancer une recherche automatisée à partir de la pochette sélectionnée ?")) {
-                            const keywords = prompt("Confirmez ou modifiez le titre/artiste à rechercher :", cleanName);
-                            if(keywords) this.searchDiscogsPromptWithText(keywords);
+                        if(cleanName !== "image" && confirm("Solution alternative : Souhaitez-vous lancer une recherche automatisée à partir du nom du fichier de l'image ?")) {
+                            this.searchDiscogsPromptWithText(cleanName);
                         }
                     }
                     reader.readAsDataURL(input.files[0]);
@@ -733,7 +775,6 @@
                 const price = document.getElementById('f-price').value;
                 let imageSrc = document.getElementById('f-image-url').value || document.getElementById('f-preview').src;
 
-                // Gestion de la vérification des doublons
                 const isDuplicate = this.data.filter(v => !v.isWishlist).some(v => 
                     v.title.toLowerCase().trim() === title.toLowerCase().trim() && 
                     v.artist.toLowerCase().trim() === artist.toLowerCase().trim()
@@ -743,7 +784,6 @@
                     return;
                 }
 
-                // Demande de confirmation définitive avant ajout
                 if (!confirm(`Confirmer l'ajout de "${title}" à votre collection ?`)) return;
 
                 let extraNotes = this.lastSelectedMetadata ? this.lastSelectedMetadata.notes : '';
